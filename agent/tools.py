@@ -367,6 +367,19 @@ TOOLS = [
     },
 ]
 
+def _to_groq(tool: dict) -> dict:
+    """Convert Anthropic tool format (input_schema) to OpenAI/Groq format (parameters)."""
+    return {
+        "type": "function",
+        "function": {
+            "name":        tool["name"],
+            "description": tool["description"],
+            "parameters":  tool["input_schema"],
+        },
+    }
+
+GROQ_TOOLS = [_to_groq(t) for t in TOOLS]
+
 TOOL_MAP = {
     "search_customer":        search_customer,
     "get_orders":             get_orders,

@@ -1,9 +1,9 @@
 """
-Customer Operations Agent — Claude-powered agentic loop.
+Customer Operations Agent — Groq-powered agentic loop.
 """
-import json, os
-import anthropic
-from agent.tools import TOOLS, TOOL_MAP
+import json, os, time, random
+from groq import Groq, RateLimitError, APIStatusError
+from agent.tools import GROQ_TOOLS, TOOL_MAP
 
 SYSTEM_PROMPT = """You are a Customer Operations Agent for an e-commerce company.
 
@@ -24,54 +24,68 @@ def run(task: str, max_turns: int = 10, verbose: bool = False) -> dict:
     Run the agent on a single task.
     Returns: {response, tool_calls, turn_count, error}
     """
-    client   = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-    messages = [{"role": "user", "content": task}]
-    tool_calls_log = []   # [{tool, input, output, turn}]
+    client   = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": task},
+    ]
+    tool_calls_log = []
     turn = 0
 
     while turn < max_turns:
         turn += 1
-        resp = client.messages.create(
-            model    = "claude-sonnet-4-6",
-            max_tokens = 4096,
-            system   = SYSTEM_PROMPT,
-            tools    = TOOLS,
-            messages = messages,
-        )
 
-        if verbose:
-            print(f"\n── Turn {turn} | stop_reason: {resp.stop_reason}")
-
-        # Collect assistant message
-        messages.append({"role": "assistant", "content": resp.content})
-
-        if resp.stop_reason == "end_turn":
-            final_text = next(
-                (b.text for b in resp.content if hasattr(b, "text")), ""
-            )
+        # call with exponential backoff on rate limits
+        for attempt in range(6):
+            try:
+                resp = client.chat.completions.create(
+                    model       = "llama-3.3-70b-versatile",
+                    messages    = messages,
+                    tools       = GROQ_TOOLS,
+                    tool_choice = "auto",
+                    max_tokens  = 4096,
+                )
+                break
+            except RateLimitError:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"   [rate limit] waiting {wait:.1f}s (attempt {attempt+1}/6)...")
+                time.sleep(wait)
+            except APIStatusError as e:
+                if e.status_code in (500, 502, 503):
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    print(f"   [server error {e.status_code}] retrying in {wait:.1f}s...")
+                    time.sleep(wait)
+                else:
+                    raise
+        else:
             return {
-                "response":    final_text,
-                "tool_calls":  tool_calls_log,
-                "turn_count":  turn,
-                "error":       None,
-            }
-
-        if resp.stop_reason != "tool_use":
-            return {
-                "response":   "",
+                "response":   "Rate limit retries exhausted.",
                 "tool_calls": tool_calls_log,
                 "turn_count": turn,
-                "error":      f"Unexpected stop_reason: {resp.stop_reason}",
+                "error":      "rate_limit_exhausted",
             }
 
-        # Execute all tool calls in this turn
-        tool_results = []
-        for block in resp.content:
-            if block.type != "tool_use":
-                continue
+        msg = resp.choices[0].message
+        finish = resp.choices[0].finish_reason
 
-            tool_name = block.name
-            tool_input = block.input
+        if verbose:
+            print(f"\n── Turn {turn} | finish_reason: {finish}")
+
+        messages.append(msg)
+
+        if finish == "stop" or not msg.tool_calls:
+            return {
+                "response":   msg.content or "",
+                "tool_calls": tool_calls_log,
+                "turn_count": turn,
+                "error":      None,
+            }
+
+        # Execute tool calls
+        for tc in msg.tool_calls:
+            tool_name  = tc.function.name
+            tool_input = json.loads(tc.function.arguments)
+
             if verbose:
                 print(f"   → {tool_name}({json.dumps(tool_input)[:120]})")
 
@@ -90,13 +104,11 @@ def run(task: str, max_turns: int = 10, verbose: bool = False) -> dict:
                 "input":  tool_input,
                 "output": result,
             })
-            tool_results.append({
-                "type":        "tool_result",
-                "tool_use_id": block.id,
-                "content":     result,
+            messages.append({
+                "role":         "tool",
+                "tool_call_id": tc.id,
+                "content":      result,
             })
-
-        messages.append({"role": "user", "content": tool_results})
 
     return {
         "response":   "Max turns reached without a final answer.",
