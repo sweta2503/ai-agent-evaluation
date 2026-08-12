@@ -12,6 +12,8 @@ DB_PATH = Path(__file__).parent.parent / "database" / "ops.db"
 # injected by the evaluator for failure simulation
 _FAIL_TOOL: str | None = None
 _FAIL_PROBABILITY: float = 0.0
+_FAIL_MAX: int = 0          # 0 = unlimited; >0 = fail at most N times then succeed
+_fail_count: int = 0        # how many times we've already failed this task
 
 
 def _conn():
@@ -21,8 +23,14 @@ def _conn():
 
 
 def _maybe_fail(tool_name: str):
-    """Simulate transient 503 for tool failure tests."""
-    if _FAIL_TOOL == tool_name and random.random() < _FAIL_PROBABILITY:
+    """Simulate transient 503. Respects max_failures so failure is deterministic."""
+    global _fail_count
+    if _FAIL_TOOL != tool_name:
+        return
+    if _FAIL_MAX > 0 and _fail_count >= _FAIL_MAX:
+        return   # already failed enough times — let it succeed
+    if random.random() < _FAIL_PROBABILITY:
+        _fail_count += 1
         raise RuntimeError(f"503 Service Unavailable — {tool_name} timed out")
 
 

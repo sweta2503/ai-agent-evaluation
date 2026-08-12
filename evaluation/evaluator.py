@@ -1,9 +1,9 @@
 """
 AgentBench-100 evaluator.
 Usage:
-    python -m evaluation.evaluator --version v1 [--tasks 10] [--category simple_retrieval]
+    python -m evaluation.evaluator --version v1 [--tasks 10] [--category X]
 """
-import argparse, json, time
+import argparse, json, time, shutil, sqlite3
 from pathlib import Path
 from datetime import datetime
 
@@ -13,6 +13,18 @@ from evaluation.metrics import evaluate_result
 
 TASKS_FILE  = Path(__file__).parent.parent / "benchmark" / "tasks.json"
 RESULTS_DIR = Path(__file__).parent.parent / "results"
+DB_PATH     = Path(__file__).parent.parent / "database" / "ops.db"
+DB_SNAPSHOT = Path(__file__).parent.parent / "database" / "ops_snapshot.db"
+
+
+def snapshot_db():
+    """Copy the current DB to a snapshot before any tasks run."""
+    shutil.copy2(DB_PATH, DB_SNAPSHOT)
+
+
+def restore_db():
+    """Restore DB from snapshot — called before every task."""
+    shutil.copy2(DB_SNAPSHOT, DB_PATH)
 
 
 def load_tasks(category=None, limit=None):
@@ -28,6 +40,9 @@ def run_evaluation(version="v1", category=None, limit=None, verbose=False):
     tasks   = load_tasks(category, limit)
     results = []
 
+    # Take a clean snapshot once before the run starts
+    snapshot_db()
+
     print(f"\n{'='*60}")
     print(f"  AgentBench-100  |  {version}  |  {len(tasks)} tasks")
     print(f"{'='*60}\n")
@@ -35,14 +50,20 @@ def run_evaluation(version="v1", category=None, limit=None, verbose=False):
     for i, task in enumerate(tasks):
         print(f"[{i+1:>3}/{len(tasks)}] Cat: {task['category']:<22} | {task['task'][:60]}...")
 
-        # inject tool failure if specified
+        # Restore clean DB before every task so mutations don't bleed across
+        restore_db()
+
+        # Configure tool failure injection
         failure = task.get("inject_failure")
         if failure:
             tool_module._FAIL_TOOL        = failure["tool"]
             tool_module._FAIL_PROBABILITY = failure["probability"]
+            tool_module._FAIL_MAX         = failure.get("max_failures", 0)
         else:
             tool_module._FAIL_TOOL        = None
             tool_module._FAIL_PROBABILITY = 0.0
+            tool_module._FAIL_MAX         = 0
+        tool_module._fail_count = 0   # reset per-task failure counter
 
         t0 = time.time()
         try:
@@ -59,32 +80,31 @@ def run_evaluation(version="v1", category=None, limit=None, verbose=False):
               f"turns={agent_result['turn_count']}  {elapsed}s")
 
         results.append({
-            "task_id":  task["id"],
-            "category": task["category"],
-            "task":     task["task"],
-            "scores":   scores,
-            "avg_score": avg,
+            "task_id":      task["id"],
+            "category":     task["category"],
+            "task":         task["task"],
+            "scores":       scores,
+            "avg_score":    avg,
             "agent_result": agent_result,
-            "elapsed_s": elapsed,
+            "elapsed_s":    elapsed,
         })
 
-    # ── Save ──────────────────────────────────────────────
+    # Save results
     out_dir  = RESULTS_DIR / version
     out_dir.mkdir(parents=True, exist_ok=True)
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_file = out_dir / f"results_{ts}.json"
     out_file.write_text(json.dumps(results, indent=2))
 
-    # ── Scorecard ─────────────────────────────────────────
     print_scorecard(results, version)
     return results
 
 
 def print_scorecard(results, version="v1"):
-    metrics = ["final_answer","tool_selection","argument_accuracy",
-               "trajectory","task_success","safety","efficiency"]
-    labels  = ["Final Answer","Tool Selection","Argument Accuracy",
-               "Trajectory","Task Success","Safety","Efficiency"]
+    metrics = ["final_answer", "tool_selection", "argument_accuracy",
+               "trajectory", "task_success", "safety", "efficiency"]
+    labels  = ["Final Answer", "Tool Selection", "Argument Accuracy",
+               "Trajectory", "Task Success", "Safety", "Efficiency"]
 
     print(f"\n{'='*60}")
     print(f"  SCORECARD — {version}  ({len(results)} tasks)")
