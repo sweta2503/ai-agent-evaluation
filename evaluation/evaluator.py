@@ -3,7 +3,7 @@ AgentBench-100 evaluator.
 Usage:
     python -m evaluation.evaluator --version v1 [--tasks 10] [--category X]
 """
-import argparse, json, time, shutil, sqlite3
+import argparse, json, time, shutil
 from pathlib import Path
 from datetime import datetime
 
@@ -11,20 +11,19 @@ from agent import tools as tool_module
 from agent.agent import run
 from evaluation.metrics import evaluate_result
 
-TASKS_FILE  = Path(__file__).parent.parent / "benchmark" / "tasks.json"
+TASKS_FILE = Path(__file__).parent.parent / "benchmark" / "tasks.json"
 RESULTS_DIR = Path(__file__).parent.parent / "results"
 DB_PATH     = Path(__file__).parent.parent / "database" / "ops.db"
-DB_SNAPSHOT = Path(__file__).parent.parent / "database" / "ops_snapshot.db"
-
-
-def snapshot_db():
-    """Copy the current DB to a snapshot before any tasks run."""
-    shutil.copy2(DB_PATH, DB_SNAPSHOT)
+DB_BASELINE = Path(__file__).parent.parent / "database" / "ops_baseline.db"
 
 
 def restore_db():
-    """Restore DB from snapshot — called before every task."""
-    shutil.copy2(DB_SNAPSHOT, DB_PATH)
+    """Restore ops.db from the permanent baseline before every task."""
+    if not DB_BASELINE.exists():
+        raise FileNotFoundError(
+            "ops_baseline.db not found. Run: python benchmark/build_tasks.py"
+        )
+    shutil.copy2(DB_BASELINE, DB_PATH)
 
 
 def load_tasks(category=None, limit=None):
@@ -40,20 +39,17 @@ def run_evaluation(version="v1", category=None, limit=None, verbose=False):
     tasks   = load_tasks(category, limit)
     results = []
 
-    # Take a clean snapshot once before the run starts
-    snapshot_db()
-
     print(f"\n{'='*60}")
-    print(f"  AgentBench-100  |  {version}  |  {len(tasks)} tasks")
+    print(f"  AgentBench-100  |  {version.upper()}  |  {len(tasks)} tasks")
     print(f"{'='*60}\n")
 
     for i, task in enumerate(tasks):
-        print(f"[{i+1:>3}/{len(tasks)}] Cat: {task['category']:<22} | {task['task'][:60]}...")
+        print(f"[{i+1:>3}/{len(tasks)}] Cat: {task['category']:<22} | {task['task'][:58]}...")
 
-        # Restore clean DB before every task so mutations don't bleed across
+        # Restore identical baseline DB before every task
         restore_db()
 
-        # Configure tool failure injection
+        # Configure deterministic tool failure injection
         failure = task.get("inject_failure")
         if failure:
             tool_module._FAIL_TOOL        = failure["tool"]
@@ -63,11 +59,11 @@ def run_evaluation(version="v1", category=None, limit=None, verbose=False):
             tool_module._FAIL_TOOL        = None
             tool_module._FAIL_PROBABILITY = 0.0
             tool_module._FAIL_MAX         = 0
-        tool_module._fail_count = 0   # reset per-task failure counter
+        tool_module._fail_count = 0
 
         t0 = time.time()
         try:
-            agent_result = run(task["task"], verbose=verbose)
+            agent_result = run(task["task"], version=version, verbose=verbose)
         except Exception as e:
             agent_result = {"response": "", "tool_calls": [], "turn_count": 0, "error": str(e)}
 
@@ -89,7 +85,6 @@ def run_evaluation(version="v1", category=None, limit=None, verbose=False):
             "elapsed_s":    elapsed,
         })
 
-    # Save results
     out_dir  = RESULTS_DIR / version
     out_dir.mkdir(parents=True, exist_ok=True)
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -107,7 +102,7 @@ def print_scorecard(results, version="v1"):
                "Trajectory", "Task Success", "Safety", "Efficiency"]
 
     print(f"\n{'='*60}")
-    print(f"  SCORECARD — {version}  ({len(results)} tasks)")
+    print(f"  SCORECARD — {version.upper()}  ({len(results)} tasks)")
     print(f"{'='*60}")
     for metric, label in zip(metrics, labels):
         scores = [r["scores"][metric]["score"] for r in results if metric in r["scores"]]

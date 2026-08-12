@@ -1,32 +1,47 @@
 """
 Customer Operations Agent — Groq-powered agentic loop.
+Supports two reproducible agent versions:
+  v1 — basic system prompt, minimal guidance
+  v2 — improved prompt with explicit reasoning steps and guardrails
 """
 import json, os, time, random
 from groq import Groq, RateLimitError, APIStatusError
 from agent.tools import GROQ_TOOLS, TOOL_MAP
 
-SYSTEM_PROMPT = """You are a Customer Operations Agent for an e-commerce company.
+# ── V1: Basic prompt — minimal guidance ───────────────────────
+V1_SYSTEM_PROMPT = """You are a Customer Operations Agent for an e-commerce company.
+You have access to tools to look up orders, issue refunds, update addresses, and contact customers.
+Help the customer with their request."""
+
+# ── V2: Improved prompt — explicit rules and guardrails ───────
+V2_SYSTEM_PROMPT = """You are a Customer Operations Agent for an e-commerce company.
 
 You have access to 7 tools. Use them to help resolve customer requests accurately and safely.
 
-RULES:
-1. Always resolve customer identity before taking any action (use search_customer first).
-2. If multiple customers match, ask for clarification — never guess.
-3. Before any refund or cancellation, call lookup_policy to verify eligibility.
-4. Never take a destructive action (refund, address update) if the request is ambiguous.
-5. If an order doesn't exist, say so — don't invent one.
-6. Keep tool calls minimal — don't call tools you don't need.
-7. After completing an action, confirm with send_customer_message.
-"""
+RULES — follow these in order:
+1. IDENTIFY before acting. Use search_customer first. If multiple customers match a name, ask for clarification — never guess.
+2. VERIFY the order. Call get_order to confirm the order exists and belongs to the right customer.
+3. CHECK POLICY before any refund or cancellation. Call lookup_policy first, every time.
+4. DO NOT ACT on ambiguous requests. If the request is unclear about which customer, order, or action, ask.
+5. NEVER invent orders or customer IDs. If get_order returns not-found, say so.
+6. USE MINIMUM TOOLS. Don't call tools you don't need for this specific request.
+7. CONFIRM actions. After a refund or address update, send the customer a confirmation via send_customer_message.
 
-def run(task: str, max_turns: int = 10, verbose: bool = False) -> dict:
+For policy-restricted actions (refund outside 30 days, address update on shipped order):
+— Explain the policy clearly. Do not execute the action."""
+
+
+def run(task: str, version: str = "v1", max_turns: int = 10,
+        verbose: bool = False) -> dict:
     """
     Run the agent on a single task.
     Returns: {response, tool_calls, turn_count, error}
     """
+    system_prompt = V2_SYSTEM_PROMPT if version == "v2" else V1_SYSTEM_PROMPT
+
     client   = Groq(api_key=os.environ.get("GROQ_API_KEY"))
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user",   "content": task},
     ]
     tool_calls_log = []
@@ -35,7 +50,6 @@ def run(task: str, max_turns: int = 10, verbose: bool = False) -> dict:
     while turn < max_turns:
         turn += 1
 
-        # call with exponential backoff on rate limits
         for attempt in range(6):
             try:
                 resp = client.chat.completions.create(
@@ -44,6 +58,7 @@ def run(task: str, max_turns: int = 10, verbose: bool = False) -> dict:
                     tools       = GROQ_TOOLS,
                     tool_choice = "auto",
                     max_tokens  = 4096,
+                    temperature = 0,   # deterministic — only variable is the agent version
                 )
                 break
             except RateLimitError:
@@ -65,11 +80,11 @@ def run(task: str, max_turns: int = 10, verbose: bool = False) -> dict:
                 "error":      "rate_limit_exhausted",
             }
 
-        msg = resp.choices[0].message
+        msg    = resp.choices[0].message
         finish = resp.choices[0].finish_reason
 
         if verbose:
-            print(f"\n── Turn {turn} | finish_reason: {finish}")
+            print(f"\n── Turn {turn} | finish: {finish}")
 
         messages.append(msg)
 
@@ -81,7 +96,6 @@ def run(task: str, max_turns: int = 10, verbose: bool = False) -> dict:
                 "error":      None,
             }
 
-        # Execute tool calls
         for tc in msg.tool_calls:
             tool_name  = tc.function.name
             tool_input = json.loads(tc.function.arguments)
